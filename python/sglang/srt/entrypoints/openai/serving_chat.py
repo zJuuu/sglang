@@ -629,6 +629,8 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        content_ever_emitted: dict[int, bool] = {}
+        reasoning_accumulated: dict[int, str] = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -715,6 +717,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
+                        reasoning_accumulated[index] = (
+                            reasoning_accumulated.get(index, "") + reasoning_text
+                        )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -738,6 +743,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # Track if any non-reasoning content is available
+                if delta:
+                    content_ever_emitted[index] = True
 
                 # Handle tool calls
                 if (
@@ -793,6 +802,29 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+            # Fallback: if reasoning was streamed but no content or tool calls
+            # were ever emitted, the model put its answer inside the think block
+            # (common in multi-turn tool-result follow-ups). Re-emit the
+            # accumulated reasoning as content so the client gets a usable response.
+            for idx in reasoning_accumulated:
+                if (
+                    not content_ever_emitted.get(idx)
+                    and not has_tool_calls.get(idx)
+                    and reasoning_accumulated[idx]
+                ):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=idx,
+                        delta=DeltaMessage(content=reasoning_accumulated[idx]),
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -987,6 +1019,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
+
+            # Fallback: if reasoning is non-empty but content and tool_calls
+            # are both empty, the model put its answer inside the think block
+            # (common in multi-turn tool-result follow-ups). Treat reasoning
+            # as content so the client gets a usable response.
+            if reasoning_text and not text.strip() and not tool_calls:
+                text = reasoning_text
+                reasoning_text = None
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,

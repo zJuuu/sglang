@@ -242,6 +242,33 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class DeepSeekV3ThinkingDetector(BaseReasoningFormatDetector):
+    """
+    Detector for DeepSeek V3/V3.2 models with thinking mode.
+    Uses <think>/<\/think> tokens like Qwen3 but also sets tool_start_token
+    to handle DSML function calls that may appear within thinking blocks
+    (e.g., in multi-turn tool-result follow-ups where the model transitions
+    directly from thinking to tool calls without emitting <\/think>).
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<｜DSML｜function_calls>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -463,7 +490,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
-        "deepseek-v3": Qwen3Detector,
+        "deepseek-v3": DeepSeekV3ThinkingDetector,
         "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
