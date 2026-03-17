@@ -629,8 +629,11 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
-        content_ever_emitted: dict[int, bool] = {}
-        reasoning_accumulated: dict[int, str] = {}
+        _is_tool_result_turn = (
+            request.messages
+            and request.messages[-1].role == "tool"
+        )
+        pending_reasoning: dict[int, str] = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -716,37 +719,36 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
-                    if reasoning_text:
-                        reasoning_accumulated[index] = (
-                            reasoning_accumulated.get(index, "") + reasoning_text
-                        )
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
 
-                        # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
-                            chunk.usage = UsageProcessor.calculate_token_usage(
-                                prompt_tokens=prompt_tokens.get(index, 0),
-                                completion_tokens=completion_tokens.get(index, 0),
+                    if _is_tool_result_turn:
+                        if reasoning_text:
+                            pending_reasoning[index] = (
+                                pending_reasoning.get(index, "") + reasoning_text
                             )
 
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-
-                # Track if any non-reasoning content is available
-                if delta:
-                    content_ever_emitted[index] = True
+                        if delta and pending_reasoning.get(index):
+                            for rc_chunk_str in self._yield_reasoning_chunks(
+                                index,
+                                pending_reasoning[index],
+                                content,
+                                request,
+                                prompt_tokens,
+                                completion_tokens,
+                            ):
+                                yield rc_chunk_str
+                            pending_reasoning[index] = ""
+                    else:
+                        # Normal turn — stream reasoning eagerly (no TTFT hit)
+                        if reasoning_text:
+                            for rc_chunk_str in self._yield_reasoning_chunks(
+                                index,
+                                reasoning_text,
+                                content,
+                                request,
+                                prompt_tokens,
+                                completion_tokens,
+                            ):
+                                yield rc_chunk_str
 
                 # Handle tool calls
                 if (
@@ -803,19 +805,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-            # Fallback: if reasoning was streamed but no content or tool calls
-            # were ever emitted, the model put its answer inside the think block
-            # (common in multi-turn tool-result follow-ups). Re-emit the
-            # accumulated reasoning as content so the client gets a usable response.
-            for idx in reasoning_accumulated:
-                if (
-                    not content_ever_emitted.get(idx)
-                    and not has_tool_calls.get(idx)
-                    and reasoning_accumulated[idx]
-                ):
+            for idx, pending in pending_reasoning.items():
+                if pending and not has_tool_calls.get(idx):
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=idx,
-                        delta=DeltaMessage(content=reasoning_accumulated[idx]),
+                        delta=DeltaMessage(content=pending),
                         finish_reason=None,
                     )
                     chunk = ChatCompletionStreamResponse(
@@ -1230,6 +1224,37 @@ class OpenAIServingChat(OpenAIServingBase):
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
         return ChoiceLogprobs(content=token_logprobs)
+
+    @staticmethod
+    def _yield_reasoning_chunks(
+        index: int,
+        reasoning_text: str,
+        content: Dict[str, Any],
+        request: "ChatCompletionRequest",
+        prompt_tokens: Dict[int, int],
+        completion_tokens: Dict[int, int],
+    ) -> list[str]:
+        """Build SSE chunks for reasoning_content and return as strings."""
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=index,
+            delta=DeltaMessage(reasoning_content=reasoning_text),
+            finish_reason=None,
+        )
+        chunk = ChatCompletionStreamResponse(
+            id=content["meta_info"]["id"],
+            created=int(time.time()),
+            choices=[choice_data],
+            model=request.model,
+        )
+        if (
+            request.stream_options
+            and request.stream_options.continuous_usage_stats
+        ):
+            chunk.usage = UsageProcessor.calculate_token_usage(
+                prompt_tokens=prompt_tokens.get(index, 0),
+                completion_tokens=completion_tokens.get(index, 0),
+            )
+        return [f"data: {chunk.model_dump_json()}\n\n"]
 
     def _process_reasoning_stream(
         self,
